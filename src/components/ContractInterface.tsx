@@ -1,7 +1,8 @@
 'use client';
 import { useState, useMemo, useEffect, useCallback } from 'react';
 import { useWriteContract, useReadContract, useWaitForTransactionReceipt } from 'wagmi';
-import { Play, Eye, Send, Loader2, CheckCircle, XCircle } from 'lucide-react';
+import { Play, Eye, Send, Loader2, CheckCircle, XCircle, DollarSign } from 'lucide-react';
+import { parseEther } from 'viem';
 
 interface ContractInterfaceProps {
   contractAddress: string;
@@ -28,6 +29,11 @@ interface FunctionInputs {
   };
 }
 
+// 新增：ETH支付金额的类型定义
+interface PaymentAmounts {
+  [functionName: string]: string;
+}
+
 // 定义合约函数返回值的类型
 type ContractFunctionResult = string | number | boolean | bigint | unknown[] | Record<string, unknown>;
 
@@ -41,6 +47,8 @@ interface ReadConfig {
 
 export default function ContractInterface({ contractAddress, contractAbi }: ContractInterfaceProps) {
   const [functionInputs, setFunctionInputs] = useState<FunctionInputs>({});
+  // 新增：支付金额状态
+  const [paymentAmounts, setPaymentAmounts] = useState<PaymentAmounts>({});
 
   const [results, setResults] = useState<{ [key: string]: ContractFunctionResult }>({});
   const [errors, setErrors] = useState<{ [key: string]: string }>({});
@@ -90,9 +98,20 @@ export default function ContractInterface({ contractAddress, contractAbi }: Cont
           errorMessage.includes('canceled')) {
         displayMessage = '❌ 用户取消了交易';
       } else if (errorMessage.includes('insufficient funds')) {
-        displayMessage = '❌ 余额不足，无法支付gas费用';
+        displayMessage = '❌ 余额不足，无法支付gas费用或ETH';
+      } else if (errorMessage.includes('Insufficient payment') || 
+                 errorMessage.includes('insufficient payment')) {
+        displayMessage = '❌ 支付金额不足，请检查合约要求的最小支付金额';
+      } else if (errorMessage.includes('execution reverted')) {
+        if (errorMessage.includes('Insufficient payment')) {
+          displayMessage = '❌ 交易失败: 支付金额不足。请增加ETH支付金额或检查合约要求';
+        } else {
+          displayMessage = `❌ 合约执行失败: ${errorMessage}`;
+        }
       } else if (errorMessage.includes('gas')) {
         displayMessage = `❌ Gas相关错误: ${errorMessage}`;
+      } else if (errorMessage.includes('value')) {
+        displayMessage = `❌ 支付金额错误: ${errorMessage}`;
       } else {
         displayMessage = `❌ 交易失败: ${errorMessage}`;
       }
@@ -334,6 +353,55 @@ export default function ContractInterface({ contractAddress, contractAbi }: Cont
     }));
   };
 
+  // 新增：处理支付金额变化
+  const handlePaymentAmountChange = (functionName: string, value: string) => {
+    setPaymentAmounts(prev => ({
+      ...prev,
+      [functionName]: value
+    }));
+    
+    // 清除之前的错误信息
+    if (errors[functionName] && errors[functionName].includes('支付金额')) {
+      setErrors(prev => ({
+        ...prev,
+        [functionName]: ''
+      }));
+    }
+  };
+
+  // 新增：验证支付金额
+  const validatePaymentAmount = (amount: string): { isValid: boolean; error?: string } => {
+    if (!amount || amount.trim() === '') {
+      return { isValid: false, error: '请输入支付金额' };
+    }
+    
+    const numAmount = parseFloat(amount);
+    if (isNaN(numAmount)) {
+      return { isValid: false, error: '支付金额必须是有效数字' };
+    }
+    
+    if (numAmount < 0) {
+      return { isValid: false, error: '支付金额不能为负数' };
+    }
+    
+    if (numAmount === 0) {
+      return { isValid: false, error: '支付金额必须大于0' };
+    }
+    
+    // 检查是否超过合理范围（比如1000 ETH）
+    if (numAmount > 1000) {
+      return { isValid: false, error: '支付金额过大，请确认是否正确' };
+    }
+    
+    // 检查小数位数是否过多（最多18位小数）
+    const decimalParts = amount.split('.');
+    if (decimalParts.length > 1 && decimalParts[1].length > 18) {
+      return { isValid: false, error: 'ETH最多支持18位小数' };
+    }
+    
+    return { isValid: true };
+  };
+
   // 转换输入参数
   const convertInputValue = (value: string, type: string) => {
     if (!value) return undefined;
@@ -463,15 +531,52 @@ export default function ContractInterface({ contractAddress, contractAbi }: Cont
     }).filter(val => val !== undefined);
 
     try {
+      // 准备基础参数
       const gasLimit = estimateGasLimit(func.name, func.inputs.length);
-      
-      await writeContract({
-        address: contractAddress as `0x${string}`,
-        abi: JSON.parse(contractAbi),
-        functionName: func.name,
-        args: inputs,
-        gas: gasLimit, // 使用智能估算的 gas limit
-      });
+
+      // 如果是 payable 函数，处理支付金额
+      if (func.stateMutability === 'payable') {
+        const paymentAmount = paymentAmounts[func.name] || '';
+        
+        // 验证支付金额
+        const validation = validatePaymentAmount(paymentAmount);
+        if (!validation.isValid) {
+          setErrors(prev => ({
+            ...prev,
+            [func.name]: `❌ ${validation.error}`
+          }));
+          setCurrentExecutingFunction('');
+          return;
+        }
+
+        try {
+          const ethValue = parseEther(paymentAmount);
+          await writeContract({
+            address: contractAddress as `0x${string}`,
+            abi: JSON.parse(contractAbi),
+            functionName: func.name,
+            args: inputs,
+            gas: gasLimit,
+            value: ethValue,
+          });
+        } catch (parseError) {
+          setErrors(prev => ({
+            ...prev,
+            [func.name]: `❌ 支付金额格式错误: ${parseError}`
+          }));
+          setCurrentExecutingFunction('');
+          return;
+        }
+      } else {
+        // 非 payable 函数，不需要 value 参数
+        await writeContract({
+          address: contractAddress as `0x${string}`,
+          abi: JSON.parse(contractAbi),
+          functionName: func.name,
+          args: inputs,
+          gas: gasLimit,
+        });
+      }
 
       setResults(prev => ({
         ...prev,
@@ -494,7 +599,7 @@ export default function ContractInterface({ contractAddress, contractAbi }: Cont
 
   // 渲染函数输入框
   const renderFunctionInputs = (func: AbiFunction) => {
-    return func.inputs.map((input) => (
+    const inputElements = func.inputs.map((input) => (
       <div key={input.name} className="space-y-2">
         <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
           {input.name} ({input.type})
@@ -508,6 +613,32 @@ export default function ContractInterface({ contractAddress, contractAbi }: Cont
         />
       </div>
     ));
+
+    // 如果是 payable 函数，添加 ETH 支付金额输入框
+    if (func.stateMutability === 'payable') {
+      inputElements.push(
+        <div key="payment-amount" className="space-y-2">
+          <label className="block text-sm font-medium text-orange-700 dark:text-orange-300 flex items-center">
+            <DollarSign className="w-4 h-4 mr-1" />
+            支付金额 (ETH) *
+          </label>
+          <input
+            type="number"
+            step="0.000000000000000001"
+            min="0"
+            value={paymentAmounts[func.name] || ''}
+            onChange={(e) => handlePaymentAmountChange(func.name, e.target.value)}
+            placeholder="输入要发送的 ETH 数量"
+            className="w-full px-3 py-2 border border-orange-300 dark:border-orange-600 rounded-md focus:ring-2 focus:ring-orange-500 focus:border-transparent dark:bg-gray-700 dark:text-white text-sm bg-orange-50 dark:bg-orange-900/20"
+          />
+          <p className="text-xs text-orange-600 dark:text-orange-400">
+            此函数需要支付 ETH，请输入要发送的金额
+          </p>
+        </div>
+      );
+    }
+
+    return inputElements;
   };
 
   // 渲染函数卡片
